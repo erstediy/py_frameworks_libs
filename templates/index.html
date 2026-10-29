@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Платёжная система</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="page">
+  <header class="page-header">
+    <div>
+      <span class="eyebrow">Учебный проект</span>
+      <h1>Платёжная система</h1>
+      <p class="muted">Оплата, возвраты и регулярные списания с уведомлениями в Telegram.</p>
+    </div>
+    <span class="mode {{ 'live' if settings.live_mode else '' }}">
+      {{ 'Реальные платежи' if settings.live_mode else 'Тестовая ЮKassa' }}
+    </span>
+  </header>
+
+  {% for category, message in get_flashed_messages(with_categories=true) %}
+    <div class="notice {{ category }}" role="status">{{ message }}</div>
+  {% endfor %}
+  {% if not settings.gateway_configured %}
+    <div class="notice warning">ЮKassa ещё не настроена. Добавьте идентификатор магазина и секретный ключ в файл .env, затем перезапустите приложение.</div>
+  {% endif %}
+  {% if not settings.telegram_configured %}
+    <div class="notice warning">Telegram ещё не настроен. Добавьте токен бота и идентификатор чата в .env. Ожидающие уведомления видны ниже.</div>
+  {% endif %}
+  {% if worker_error %}
+    <div class="notice error">Фоновая обработка: {{ worker_error }}</div>
+  {% endif %}
+
+  <div class="intro-grid">
+    <section class="card">
+      <div class="section-heading"><h2>Новый платёж</h2><span class="muted">RUB</span></div>
+      <form method="post" action="{{ url_for('create_payment') }}" class="payment-form">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <label>Пользователь
+          <input name="customer" maxlength="100" required placeholder="Например, Иван Петров" autocomplete="name">
+        </label>
+        <label>Сумма, ₽
+          <input name="amount" value="100.00" required inputmode="decimal" placeholder="100.00">
+        </label>
+        <label class="check-row"><input type="checkbox" name="recurring" id="recurring" value="1"> Регулярный платёж</label>
+        <div id="recurring-fields" hidden>
+          <label>Интервал между платежами, дней
+            <input type="number" name="interval_days" id="interval-days" value="30" min="1" max="365">
+          </label>
+          <label class="check-row consent"><input type="checkbox" name="consent" id="consent" value="1"> Пользователь согласен на сохранение способа оплаты и автоматические списания с выбранным интервалом.</label>
+          <p class="field-note">При неудачном автоплатеже повтор запланируется через сутки.
+            {% if settings.retry_policy == 'daily' %}Повторы выполняются каждые сутки до успеха или отмены подписки.
+            {% else %}После повторного отказа подписка приостанавливается.{% endif %}
+          </p>
+        </div>
+        <button class="primary" type="submit" {% if not settings.gateway_configured %}disabled{% endif %}>Перейти к оплате</button>
+      </form>
+    </section>
+    <aside class="card guide">
+      <span class="eyebrow">Как это работает</span>
+      <h2>Одна страница для всех операций</h2>
+      <ol>
+        <li>Создайте платёж и завершите оплату на странице ЮKassa.</li>
+        <li>Приложение проверит результат и отправит статус в Telegram. При отказе в сообщении будет причина.</li>
+        <li>Для подписки способ оплаты сохраняется в ЮKassa, а следующие списания выполняются автоматически.</li>
+      </ol>
+      <p class="field-note">Для проверки статусов и выполнения автоплатежей приложение должно быть запущено. Все даты указаны по московскому времени.</p>
+    </aside>
+  </div>
+
+  <section class="card section">
+    <div class="section-heading"><h2>Платежи</h2><span class="counter">{{ payments | length }}</span></div>
+    {% if payments %}
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Пользователь / платёж</th><th>Сумма</th><th>Тип</th><th>Статус</th><th>Действия</th></tr></thead>
+          <tbody>
+          {% for p in payments %}
+            <tr>
+              <td><strong>{{ p.customer }}</strong><small>{{ p.created_at | dt }}</small><small class="mono" title="{{ p.id }}">{{ p.id[:12] }}</small>{% if p.gateway_id %}<small class="muted mono" title="ID ЮKassa">{{ p.gateway_id }}</small>{% endif %}</td>
+              <td class="amount">{{ p.amount }} ₽</td>
+              <td>{{ p.kind | kind_label }}</td>
+              <td><span class="badge {{ p.status }}">{{ p.status | payment_status }}</span>{% if p.reason %}<small class="reason">{{ p.reason }}</small>{% endif %}</td>
+              <td><div class="actions">
+                {% if p.confirmation_url and p.status in ['pending', 'waiting_for_capture'] %}<a class="button" href="{{ p.confirmation_url }}" rel="noreferrer">Оплатить</a>{% endif %}
+                <form method="post" action="{{ url_for('refresh_payment', payment_id=p.id) }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <button type="submit" class="secondary">Проверить статус</button>
+                </form>
+                {% if p.refundable %}
+                  <form method="post" action="{{ url_for('refund_payment', payment_id=p.id) }}">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <button type="submit" class="secondary">Вернуть {{ p.amount }} ₽</button>
+                  </form>
+                {% endif %}
+              </div></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="empty">Платежей пока нет. Создайте первый платёж в форме выше.</p>{% endif %}
+  </section>
+
+  <section class="card section">
+    <div class="section-heading"><h2>Возвраты</h2><span class="counter">{{ refunds | length }}</span></div>
+    {% if refunds %}
+      <div class="table-scroll">
+        <table>
+          <thead><tr><th>Возврат / платёж</th><th>Сумма</th><th>Статус</th><th>Дата</th></tr></thead>
+          <tbody>
+          {% for r in refunds %}
+            <tr>
+              <td><span class="mono" title="{{ r.id }}">{{ r.id[:12] }}</span><small class="mono" title="{{ r.payment_id }}">Платёж: {{ r.payment_id[:12] }}</small></td>
+              <td class="amount">{{ r.amount }} ₽</td>
+              <td><span class="badge {{ r.status }}">{{ r.status | payment_status }}</span>{% if r.reason %}<small class="reason">{{ r.reason }}</small>{% endif %}</td>
+              <td>{{ r.created_at | dt }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}<p class="empty">Возвратов пока нет. Полный возврат доступен у успешно оплаченного платежа.</p>{% endif %}
+  </section>
+
+  <section class="card section">
+    <div class="section-heading"><h2>Подписки</h2><span class="counter">{{ subscriptions | length }}</span></div>
+    <p class="muted section-note">Отмена подписки прекращает будущие списания. Для возврата уже оплаченной суммы используйте кнопку у соответствующего платежа.</p>
+    {% if subscriptions %}
+      <div class="subscription-list">
+      {% for s in subscriptions %}
+        <article class="subscription">
+          <div><strong>{{ s.customer }}</strong><p>{{ s.amount }} ₽ каждые {{ s.interval_days }} дн.</p><small class="mono">{{ s.id[:12] }}</small></div>
+          <div><span class="badge {{ s.status }}">{{ s.status | subscription_status }}</span><small>Следующее списание: {{ s.next_charge_at | dt }}</small>{% if s.last_error %}<small class="reason">{{ s.last_error }}</small>{% endif %}</div>
+          {% if s.status != 'canceled' %}
+            <form method="post" action="{{ url_for('cancel_subscription', subscription_id=s.id) }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button type="submit" class="secondary">Отменить подписку</button>
+            </form>
+          {% endif %}
+        </article>
+      {% endfor %}
+      </div>
+    {% else %}<p class="empty">Подписок пока нет. Отметьте «Регулярный платёж» при создании оплаты.</p>{% endif %}
+  </section>
+
+  <section class="card section">
+    <div class="section-heading"><h2>Уведомления в Telegram</h2><span class="counter">{{ notifications | length }}</span></div>
+    {% if notifications %}
+      <div class="notification-list">
+      {% for n in notifications %}
+        <article class="notification">
+          <div class="notification-heading"><span class="badge {{ 'succeeded' if n.sent_at else 'pending' }}">{{ 'Отправлено' if n.sent_at else 'Ожидает отправки' }}</span>{% if n.sent_at %}<small>{{ n.sent_at | dt }}</small>{% endif %}</div>
+          <p class="message">{{ n.text }}</p>
+          {% if n.last_error %}<small class="reason">{{ n.last_error }}</small>{% endif %}
+        </article>
+      {% endfor %}
+      </div>
+    {% else %}<p class="empty">Здесь появятся сообщения о результатах платежей.</p>{% endif %}
+  </section>
+  <footer>Flask · SQLite · ЮKassa · Telegram <span>Учебное приложение для локального запуска</span></footer>
+</main>
+<script>
+  const recurring = document.getElementById('recurring');
+  const recurringFields = document.getElementById('recurring-fields');
+  const consent = document.getElementById('consent');
+  const interval = document.getElementById('interval-days');
+  function updateRecurring() {
+    recurringFields.hidden = !recurring.checked;
+    consent.required = recurring.checked;
+    interval.disabled = !recurring.checked;
+  }
+  recurring.addEventListener('change', updateRecurring);
+  updateRecurring();
+</script>
+</body>
+</html>
